@@ -1,4 +1,4 @@
-/* Scheduled Mock Exams v1.3
+/* Scheduled Mock Exams v1.4
    Separate static website using the same Firebase project and visual system as Scheduled.
 */
 
@@ -35,7 +35,7 @@ const ADMIN_PHONE = "96176174738";
 const DEFAULT_WHATSAPP = "96176174738";
 const MAX_PDF_BYTES = 15 * 1024 * 1024;
 const FILE_CHUNK_CHARS = 450000;
-const APP_VERSION = "1.3.0";
+const APP_VERSION = "1.4.0";
 
 let currentRole = null;
 let currentUser = null;
@@ -48,7 +48,7 @@ let submissionHandle = null;
 let accessWatchRef = null;
 let attemptWatchRef = null;
 let adminDataRef = null;
-let adminData = { exams: {}, students: {}, enrollments: {}, access: {}, attempts: {}, settings: {} };
+let adminData = { exams: {}, students: {}, enrollments: {}, access: {}, attempts: {}, receipts: {}, settings: {} };
 let adminTab = "overview";
 let adminExamFilter = "";
 let pdfRenderToken = 0;
@@ -58,6 +58,10 @@ let studentSettings = {};
 let lastSeenWriteAt = 0;
 let preparedExamPdf = null;
 let examPreparePromise = null;
+let receiptSearch = "";
+let receiptStatusFilter = "all";
+let paymentBusyKeys = new Set();
+let receiptLogoDataPromise = null;
 
 const $ = (id) => document.getElementById(id);
 const now = () => Date.now() + serverOffset;
@@ -124,6 +128,25 @@ function formatDate(ts) {
   if (!ts) return "—";
   return new Intl.DateTimeFormat("en-GB", { dateStyle: "medium" }).format(new Date(Number(ts)));
 }
+function formatReceiptDate(ts) {
+  if (!ts) return "—";
+  return new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", year: "numeric" }).format(new Date(Number(ts)));
+}
+function formatReceiptTime(ts) {
+  if (!ts) return "—";
+  return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", hour12: true }).format(new Date(Number(ts)));
+}
+function money(amount) { return `$${Number(amount || 0).toFixed(2)}`; }
+function firstName(name) { return String(name || "Student").trim().split(/\s+/)[0] || "Student"; }
+function safeFilePart(value) { return String(value || "").trim().replace(/[^a-z0-9]+/gi, "_").replace(/^_+|_+$/g, "") || "Receipt"; }
+function examReceiptType(exam = {}) {
+  const custom = String(exam.receiptType || "").trim();
+  if (custom) return custom.toUpperCase();
+  const course = String(exam.course || "").trim();
+  const title = String(exam.title || "Mock Exam").trim();
+  if (course && !title.toUpperCase().includes(course.toUpperCase())) return `${course} – ${title}`.toUpperCase();
+  return title.toUpperCase();
+}
 function toDateTimeLocal(ts) {
   if (!ts) return "";
   const d = new Date(Number(ts));
@@ -152,9 +175,9 @@ function showToast(message, duration = 2800) {
   clearTimeout(showToast._timer);
   showToast._timer = setTimeout(() => el.classList.add("hidden"), duration);
 }
-function showModal(html) {
+function showModal(html, className = "") {
   const modal = $("globalModal");
-  modal.innerHTML = `<div class="modal-box">${html}</div>`;
+  modal.innerHTML = `<div class="modal-box ${escapeHtml(className)}">${html}</div>`;
   modal.classList.remove("hidden");
   modal.setAttribute("aria-hidden", "false");
 }
@@ -307,6 +330,7 @@ async function enterAdmin(user) {
   $("studentShell").classList.add("hidden");
   $("adminShell").classList.remove("hidden");
   startAdminDataListener();
+  getReceiptLogoData().catch(() => {});
 }
 
 async function enterStudent() {
@@ -828,6 +852,7 @@ function startAdminDataListener() {
       enrollments: value.enrollments || {},
       access: value.access || {},
       attempts: value.attempts || {},
+      receipts: value.receipts || {},
       settings: value.settings || {}
     };
     if (!adminExamFilter) adminExamFilter = Object.keys(adminData.exams)[0] || "";
@@ -839,7 +864,7 @@ function startAdminDataListener() {
 function stopAdminDataListener() { if (adminDataRef) adminDataRef.off(); adminDataRef = null; }
 function renderAdmin() {
   const tabs = [
-    ["overview", "Overview"], ["exams", "Exams"], ["students", "Students & Access"], ["attempts", "Attempts"], ["settings", "Settings"]
+    ["overview", "Overview"], ["exams", "Exams"], ["students", "Students & Access"], ["attempts", "Attempts"], ["receipts", "Receipts"], ["settings", "Settings"]
   ];
   $("adminShell").innerHTML = `
     <header class="topbar">
@@ -852,12 +877,14 @@ function renderAdmin() {
   else if (adminTab === "exams") renderAdminExams();
   else if (adminTab === "students") renderAdminStudents();
   else if (adminTab === "attempts") renderAdminAttempts();
+  else if (adminTab === "receipts") renderAdminReceipts();
   else renderAdminSettings();
 }
 function setAdminTab(tab) { adminTab = tab; renderAdmin(); }
 function examEntries() { return Object.entries(adminData.exams || {}).map(([id, value]) => ({ id, ...value })).sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0)); }
 function attemptEntries() { return Object.entries(adminData.attempts || {}).map(([id, value]) => ({ id, ...value })).sort((a, b) => Number(b.startedAt || 0) - Number(a.startedAt || 0)); }
 function studentEntries() { return Object.entries(adminData.students || {}).map(([phone, value]) => ({ phone, ...value })).sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""))); }
+function receiptEntries() { return Object.entries(adminData.receipts || {}).map(([id, value]) => ({ id, ...value })).sort((a, b) => Number(b.paidAt || 0) - Number(a.paidAt || 0)); }
 function enrollmentFor(examId, phone) { return adminData.enrollments?.[examId]?.[phone] || {}; }
 function selectedExam() { return adminData.exams?.[adminExamFilter] ? { id: adminExamFilter, ...adminData.exams[adminExamFilter] } : null; }
 function examStatus(exam) {
@@ -873,6 +900,8 @@ function renderAdminOverview() {
   const active = attempts.filter((a) => a.status === "active").length;
   const completed = attempts.filter((a) => ["finishedEarly", "timeEnded"].includes(a.status)).length;
   const paid = Object.values(adminData.enrollments || {}).reduce((sum, group) => sum + Object.values(group || {}).filter((e) => e.paid).length, 0);
+  const paidReceipts = receiptEntries().filter((r) => r.status === "paid");
+  const totalCollected = paidReceipts.reduce((sum, r) => sum + Number(r.amount || 0), 0);
   $("adminContent").innerHTML = `
     <div class="grid">
       <div class="metric"><div class="number">${exams.length}</div><div class="label">Mock Exams</div></div>
@@ -880,6 +909,7 @@ function renderAdminOverview() {
       <div class="metric"><div class="number">${paid}</div><div class="label">Paid Exam Accesses</div></div>
       <div class="metric"><div class="number">${active}</div><div class="label">Taking an Exam Now</div></div>
       <div class="metric"><div class="number">${completed}</div><div class="label">Completed Attempts</div></div>
+      <div class="metric"><div class="number">${money(totalCollected)}</div><div class="label">Receipt Total Collected</div></div>
     </div>
     <div class="card">
       <div class="card-head"><div><h2>Recent Attempts</h2><p class="muted">Live activity from your students.</p></div><button onclick="setAdminTab('attempts')">View All</button></div>
@@ -906,7 +936,9 @@ function openExamEditor(examId = "") {
   const exam = examId ? adminData.exams?.[examId] || {} : {};
   showModal(`
     <h2>${examId ? "Edit Mock Exam" : "Create Mock Exam"}</h2>
-    <div class="row"><div><label>Exam Title</label><input id="editExamTitle" value="${escapeHtml(exam.title || "")}" placeholder="PHYS213 Exam 2 Mock"></div><div><label>Course</label><input id="editExamCourse" value="${escapeHtml(exam.course || "")}" placeholder="PHYS213"></div></div>
+    <div class="row"><div><label>Exam Title</label><input id="editExamTitle" value="${escapeHtml(exam.title || "")}" placeholder="Mock Exam 2"></div><div><label>Course</label><input id="editExamCourse" value="${escapeHtml(exam.course || "")}" placeholder="PHYS 213"></div></div>
+    <div class="row"><div><label>Tutor Name for Receipt</label><input id="editExamTutor" value="${escapeHtml(exam.tutorName || adminData.settings.tutorName || "Marly Al Houkayem")}" placeholder="Marly Al Houkayem"></div><div><label>Price (USD)</label><input id="editExamPrice" type="number" min="0" step="0.01" value="${Number(exam.price ?? 20).toFixed(2)}"></div></div>
+    <label>Receipt Type</label><input id="editExamReceiptType" value="${escapeHtml(exam.receiptType || "")}" placeholder="PHYS 213 – MOCK EXAM 2"><p class="muted tiny">Leave blank to generate it automatically from the course and exam title.</p>
     <div class="row"><div><label>Exam Code</label><input id="editExamCode" value="${escapeHtml(exam.examCode || "")}" placeholder="PHYS213-E2"></div><div><label>Duration (minutes)</label><input id="editExamDuration" type="number" min="1" max="600" value="${Number(exam.durationMinutes || 80)}"></div></div>
     <div class="row"><div><label>Available From</label><input id="editExamFrom" type="datetime-local" value="${toDateTimeLocal(exam.availableFrom)}"></div><div><label>Available Until</label><input id="editExamUntil" type="datetime-local" value="${toDateTimeLocal(exam.availableUntil)}"></div></div>
     <div class="row"><div><label>WhatsApp Submission Countdown (minutes)</label><input id="editExamSubmission" type="number" min="1" max="30" value="${Number(exam.submissionMinutes || adminData.settings.defaultSubmissionMinutes || 5)}"></div><div><label>Exam Status</label><select id="editExamStatus"><option value="active" ${!examId || exam.status === "active" ? "selected" : ""}>Active</option><option value="hidden" ${examId && exam.status !== "active" ? "selected" : ""}>Hidden</option></select></div></div>
@@ -918,10 +950,12 @@ function openExamEditor(examId = "") {
 async function saveExam(examId = "") {
   const title = $("editExamTitle").value.trim();
   const durationMinutes = Number($("editExamDuration").value || 0);
+  const price = Number($("editExamPrice").value || 0);
   const fromRaw = $("editExamFrom").value;
   const untilRaw = $("editExamUntil").value;
   if (!title) return showToast("Enter an exam title.");
   if (!durationMinutes || durationMinutes < 1) return showToast("Enter a valid duration.");
+  if (!Number.isFinite(price) || price < 0) return showToast("Enter a valid receipt price.");
   const availableFrom = fromRaw ? new Date(fromRaw).getTime() : null;
   const availableUntil = untilRaw ? new Date(untilRaw).getTime() : null;
   if (availableFrom && availableUntil && availableUntil <= availableFrom) return showToast("Available Until must be after Available From.");
@@ -930,6 +964,9 @@ async function saveExam(examId = "") {
   const record = {
     title,
     course: $("editExamCourse").value.trim(),
+    tutorName: $("editExamTutor").value.trim() || adminData.settings.tutorName || "Marly Al Houkayem",
+    price,
+    receiptType: $("editExamReceiptType").value.trim(),
     examCode: $("editExamCode").value.trim() || `EXAM-${id.slice(-5).toUpperCase()}`,
     durationMinutes,
     availableFrom,
@@ -964,7 +1001,7 @@ async function uploadExamPdf(examId, file) {
   await rootRef(`exams/${examId}`).update({ hasPdf: true, pdfFileName: file.name, pdfSize: file.size, updatedAt: now() });
 }
 async function deleteExam(examId) {
-  if (!confirm("Delete this mock exam, its PDF, student access records, and attempts?")) return;
+  if (!confirm("Delete this mock exam, its PDF, student access records, and attempts? Existing receipts will remain permanently in Receipt History.")) return;
   const enrollments = adminData.enrollments?.[examId] || {};
   const updates = {};
   Object.values(enrollments).forEach((enrollment) => { if (enrollment.activeAccessId) updates[`access/${enrollment.activeAccessId}/allowed`] = false; });
@@ -997,14 +1034,17 @@ function renderAdminStudents() {
     </div>`;
 }
 function studentAccessTable(examId, students) {
-  return `<div class="table-wrap"><table class="table"><thead><tr><th>Student</th><th>Phone</th><th>Payment</th><th>Access</th><th>Individual Password</th><th>Attempt</th><th>Actions</th></tr></thead><tbody>${students.map((student) => {
+  return `<div class="table-wrap"><table class="table student-access-table"><thead><tr><th>Student</th><th>Phone</th><th>Payment</th><th>Access</th><th>Individual Password</th><th>Attempt</th><th>Actions</th></tr></thead><tbody>${students.map((student) => {
     const e = enrollmentFor(examId, student.phone);
     const access = e.activeAccessId ? adminData.access?.[e.activeAccessId] || {} : {};
     const attempt = e.activeAccessId ? adminData.attempts?.[e.activeAccessId] || {} : {};
     const paid = !!e.paid, allowed = e.allowed !== false;
-    return `<tr><td><strong>${escapeHtml(student.name || "")}</strong></td><td>+${escapeHtml(student.phone)}</td><td>${paid ? badge("Paid", "paid") : badge("Unpaid", "unpaid")}</td><td>${allowed ? badge("Allowed", "active") : badge("Blocked", "blocked")}</td><td>${e.loginPassword ? `<div class="code-box">${escapeHtml(e.loginPassword)}</div>` : `<span class="muted">Not generated</span>`}</td><td>${attempt.status ? attemptStatusBadge(attempt.status) : (access.usedAt ? badge("Used", "neutral") : badge("Not started", "neutral"))}</td><td><div class="table-actions"><button class="small-btn ${paid ? "warning" : "success"}" onclick="togglePaid('${examId}','${student.phone}')">${paid ? "Mark Unpaid" : "Mark Paid"}</button><button class="small-btn ghost" onclick="toggleStudentAllowed('${examId}','${student.phone}')">${allowed ? "Block" : "Allow"}</button><button class="small-btn" ${paid && allowed ? "" : "disabled"} onclick="generateStudentLogin('${examId}','${student.phone}')">Generate Password</button><button class="small-btn whatsapp" ${e.loginPassword && paid && allowed ? "" : "disabled"} onclick="sendStudentLoginWhatsApp('${examId}','${student.phone}')">WhatsApp</button><button class="small-btn danger" onclick="removeStudentFromExam('${examId}','${student.phone}')">Remove</button></div></td></tr>`;
+    const receipt = e.activeReceiptId ? adminData.receipts?.[e.activeReceiptId] || {} : {};
+    const hasReceipt = !!e.activeReceiptId && receipt.status === "paid";
+    return `<tr><td><strong>${escapeHtml(student.name || "")}</strong></td><td>+${escapeHtml(student.phone)}</td><td>${paid ? badge("Paid", "paid") : badge("Unpaid", "unpaid")}${hasReceipt ? `<br><span class="muted tiny">${escapeHtml(receipt.receiptNumber || "")}</span>` : ""}</td><td>${allowed ? badge("Allowed", "active") : badge("Blocked", "blocked")}</td><td>${e.loginPassword ? `<div class="code-box">${escapeHtml(e.loginPassword)}</div>` : `<span class="muted">Not generated</span>`}</td><td>${attempt.status ? attemptStatusBadge(attempt.status) : (access.usedAt ? badge("Used", "neutral") : badge("Not started", "neutral"))}</td><td><div class="table-actions"><button class="small-btn ${paid ? "warning" : "success"}" onclick="togglePaid('${examId}','${student.phone}')">${paid ? "Mark Unpaid" : "Mark Paid"}</button><button class="small-btn ghost" onclick="toggleStudentAllowed('${examId}','${student.phone}')">${allowed ? "Block" : "Allow"}</button><button class="small-btn" ${paid && allowed ? "" : "disabled"} onclick="generateStudentLogin('${examId}','${student.phone}')">Generate Password</button><button class="small-btn whatsapp" ${e.loginPassword && paid && allowed ? "" : "disabled"} onclick="sendStudentLoginWhatsApp('${examId}','${student.phone}')">Send Access Password</button>${paid && !hasReceipt ? `<button class="small-btn soft" onclick="createReceiptForExistingPayment('${examId}','${student.phone}')">Create Receipt</button>` : ""}<button class="small-btn whatsapp" ${hasReceipt ? "" : "disabled"} onclick="sendReceiptWhatsApp('${e.activeReceiptId || ""}')">Send Receipt</button><button class="small-btn ghost" ${hasReceipt ? "" : "disabled"} onclick="downloadReceiptPdf('${e.activeReceiptId || ""}')">Download Receipt</button><button class="small-btn danger" onclick="removeStudentFromExam('${examId}','${student.phone}')">Remove</button></div></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }
+
 async function addStudentToExam() {
   const exam = selectedExam(); if (!exam) return;
   const name = $("newStudentName").value.trim();
@@ -1029,14 +1069,104 @@ async function addStudentToExam() {
   });
   showToast("Student added with clean access. Mark them Paid to generate a new password.");
 }
-async function togglePaid(examId, phone) {
-  const e = enrollmentFor(examId, phone);
-  const paid = !e.paid;
-  const updates = { [`enrollments/${examId}/${phone}/paid`]: paid, [`enrollments/${examId}/${phone}/updatedAt`]: now() };
-  if (e.activeAccessId) updates[`access/${e.activeAccessId}/paid`] = paid;
-  await rootRef().update(updates);
-  showToast(paid ? "Student marked as paid." : "Student marked as unpaid. Access is paused.");
+function runFirebaseTransaction(ref, updateFn) {
+  return new Promise((resolve, reject) => {
+    ref.transaction(updateFn, (error, committed, snapshot) => {
+      if (error) reject(error);
+      else resolve({ committed, snapshot });
+    }, false);
+  });
 }
+async function nextReceiptNumber() {
+  const year = new Date(now()).getFullYear();
+  const result = await runFirebaseTransaction(rootRef(`settings/receiptCounters/${year}`), (value) => Number(value || 0) + 1);
+  if (!result.committed) throw new Error("Could not reserve a receipt number.");
+  return `SME-${year}-${String(Number(result.snapshot.val() || 0)).padStart(6, "0")}`;
+}
+async function buildPaymentReceiptRecord(examId, phone, paidAt = now()) {
+  const exam = adminData.exams?.[examId] || {};
+  const student = adminData.students?.[phone] || {};
+  if (!student.name) throw new Error("Student record not found.");
+  const receiptId = rootRef("receipts").push().key;
+  const receiptNumber = await nextReceiptNumber();
+  return {
+    receiptId,
+    receipt: {
+      receiptNumber,
+      studentName: student.name,
+      studentPhone: phone,
+      tutorName: exam.tutorName || adminData.settings.tutorName || "Marly Al Houkayem",
+      examId,
+      examTitle: exam.title || "Mock Exam",
+      examType: examReceiptType(exam),
+      amount: Number(exam.price ?? 20),
+      currency: "USD",
+      paidAt,
+      status: "paid",
+      createdAt: paidAt
+    }
+  };
+}
+async function togglePaid(examId, phone) {
+  const busyKey = `${examId}_${phone}`;
+  if (paymentBusyKeys.has(busyKey)) return;
+  paymentBusyKeys.add(busyKey);
+  try {
+    const freshSnap = await rootRef(`enrollments/${examId}/${phone}`).once("value");
+    const e = freshSnap.val() || {};
+    const paid = !e.paid;
+    const updates = { [`enrollments/${examId}/${phone}/paid`]: paid, [`enrollments/${examId}/${phone}/updatedAt`]: now() };
+    if (e.activeAccessId) updates[`access/${e.activeAccessId}/paid`] = paid;
+    if (paid) {
+      const paidAt = now();
+      const { receiptId, receipt } = await buildPaymentReceiptRecord(examId, phone, paidAt);
+      updates[`receipts/${receiptId}`] = receipt;
+      updates[`enrollments/${examId}/${phone}/paidAt`] = paidAt;
+      updates[`enrollments/${examId}/${phone}/activeReceiptId`] = receiptId;
+      updates[`enrollments/${examId}/${phone}/lastReceiptId`] = receiptId;
+      await rootRef().update(updates);
+      showToast(`Student marked as paid. Receipt ${receipt.receiptNumber} created.`, 4200);
+    } else {
+      if (e.activeReceiptId) {
+        updates[`receipts/${e.activeReceiptId}/status`] = "void";
+        updates[`receipts/${e.activeReceiptId}/voidedAt`] = now();
+      }
+      updates[`enrollments/${examId}/${phone}/activeReceiptId`] = null;
+      await rootRef().update(updates);
+      showToast("Student marked as unpaid. Access is paused and the current receipt is void.", 4200);
+    }
+  } catch (error) {
+    showToast(error.message || "Could not update payment status.", 5000);
+  } finally {
+    paymentBusyKeys.delete(busyKey);
+  }
+}
+async function createReceiptForExistingPayment(examId, phone) {
+  const busyKey = `receipt_${examId}_${phone}`;
+  if (paymentBusyKeys.has(busyKey)) return;
+  paymentBusyKeys.add(busyKey);
+  try {
+    const enrollmentSnap = await rootRef(`enrollments/${examId}/${phone}`).once("value");
+    const e = enrollmentSnap.val() || {};
+    if (!e.paid) throw new Error("Mark the student as Paid first.");
+    if (e.activeReceiptId) return showToast("This payment already has a receipt.");
+    const paidAt = now();
+    const { receiptId, receipt } = await buildPaymentReceiptRecord(examId, phone, paidAt);
+    await rootRef().update({
+      [`receipts/${receiptId}`]: receipt,
+      [`enrollments/${examId}/${phone}/paidAt`]: paidAt,
+      [`enrollments/${examId}/${phone}/activeReceiptId`]: receiptId,
+      [`enrollments/${examId}/${phone}/lastReceiptId`]: receiptId,
+      [`enrollments/${examId}/${phone}/updatedAt`]: paidAt
+    });
+    showToast(`Receipt ${receipt.receiptNumber} created.`, 3800);
+  } catch (error) {
+    showToast(error.message || "Could not create the receipt.", 5000);
+  } finally {
+    paymentBusyKeys.delete(busyKey);
+  }
+}
+
 async function toggleStudentAllowed(examId, phone) {
   const e = enrollmentFor(examId, phone);
   const allowed = e.allowed === false;
@@ -1144,6 +1274,185 @@ async function removeStudentFromExam(examId, phone) {
   showToast("Student removed. The old password is revoked; the number can be added again with a new password.", 4500);
 }
 
+function receiptStatusBadge(status) {
+  return status === "paid" ? badge("Paid", "paid") : status === "void" ? badge("Void", "blocked") : status === "refunded" ? badge("Refunded", "upcoming") : badge(status || "Unknown", "neutral");
+}
+function setReceiptFilters() {
+  receiptSearch = String($("receiptSearch")?.value || "").trim();
+  receiptStatusFilter = $("receiptStatusFilter")?.value || "all";
+  renderAdminReceipts();
+}
+function clearReceiptFilters() {
+  receiptSearch = "";
+  receiptStatusFilter = "all";
+  renderAdminReceipts();
+}
+function renderAdminReceipts() {
+  const all = receiptEntries();
+  const query = receiptSearch.toLowerCase();
+  const filtered = all.filter((r) => {
+    const matchesStatus = receiptStatusFilter === "all" || r.status === receiptStatusFilter;
+    const haystack = `${r.receiptNumber || ""} ${r.studentName || ""} ${r.studentPhone || ""} ${r.examTitle || ""} ${r.examType || ""} ${r.tutorName || ""}`.toLowerCase();
+    return matchesStatus && (!query || haystack.includes(query));
+  });
+  const paidAll = all.filter((r) => r.status === "paid");
+  const totalCollected = paidAll.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+  const groups = {};
+  filtered.forEach((r) => {
+    const key = r.examId || `deleted_${r.examTitle || "exam"}`;
+    if (!groups[key]) groups[key] = { examId: r.examId || "", title: r.examTitle || adminData.exams?.[r.examId]?.title || "Deleted Exam", receipts: [] };
+    groups[key].receipts.push(r);
+  });
+  const groupList = Object.values(groups).sort((a, b) => a.title.localeCompare(b.title));
+  $("adminContent").innerHTML = `
+    <div class="grid receipt-summary-grid">
+      <div class="metric"><div class="number">${all.length}</div><div class="label">All Receipts</div></div>
+      <div class="metric"><div class="number">${paidAll.length}</div><div class="label">Paid Receipts</div></div>
+      <div class="metric"><div class="number">${all.filter((r) => r.status === "void").length}</div><div class="label">Void Receipts</div></div>
+      <div class="metric"><div class="number">${money(totalCollected)}</div><div class="label">Total Collected</div></div>
+    </div>
+    <div class="card">
+      <div class="card-head"><div><h2>Receipt History</h2><p class="muted">Permanent payment records, grouped by mock exam.</p></div></div>
+      <div class="receipt-filters"><input id="receiptSearch" value="${escapeHtml(receiptSearch)}" placeholder="Search student, phone, or receipt number"><select id="receiptStatusFilter"><option value="all" ${receiptStatusFilter === "all" ? "selected" : ""}>All statuses</option><option value="paid" ${receiptStatusFilter === "paid" ? "selected" : ""}>Paid</option><option value="void" ${receiptStatusFilter === "void" ? "selected" : ""}>Void</option><option value="refunded" ${receiptStatusFilter === "refunded" ? "selected" : ""}>Refunded</option></select><button onclick="setReceiptFilters()">Apply</button><button class="ghost" onclick="clearReceiptFilters()">Clear</button></div>
+    </div>
+    ${groupList.length ? groupList.map(receiptExamGroupHtml).join("") : `<div class="card"><div class="empty">No receipts match the selected filters.</div></div>`}`;
+}
+function receiptExamGroupHtml(group) {
+  const paid = group.receipts.filter((r) => r.status === "paid");
+  const voids = group.receipts.filter((r) => r.status === "void");
+  const total = paid.reduce((sum, r) => sum + Number(r.amount || 0), 0);
+  return `<div class="card receipt-group"><div class="card-head"><div><h2>${escapeHtml(group.title)}</h2><p class="muted">${paid.length} paid receipt${paid.length === 1 ? "" : "s"} • ${voids.length} void • ${money(total)} collected</p></div></div>${receiptTable(group.receipts)}</div>`;
+}
+function receiptTable(receipts) {
+  return `<div class="table-wrap"><table class="table receipt-table"><thead><tr><th>Receipt #</th><th>Student</th><th>Tutor</th><th>Paid At</th><th>Total</th><th>Status</th><th>Actions</th></tr></thead><tbody>${receipts.map((r) => `<tr><td><strong>${escapeHtml(r.receiptNumber || "")}</strong></td><td><strong>${escapeHtml(r.studentName || "")}</strong><br><span class="muted tiny">+${escapeHtml(r.studentPhone || "")}</span></td><td>${escapeHtml(r.tutorName || "")}</td><td>${formatReceiptDate(r.paidAt)}<br><span class="muted tiny">${formatReceiptTime(r.paidAt)}</span></td><td><strong>${money(r.amount)}</strong></td><td>${receiptStatusBadge(r.status)}</td><td><div class="table-actions"><button class="small-btn ghost" onclick="viewReceipt('${r.id}')">View</button><button class="small-btn" onclick="downloadReceiptPdf('${r.id}')">Download PDF</button><button class="small-btn whatsapp" ${r.status === "paid" ? "" : "disabled"} onclick="sendReceiptWhatsApp('${r.id}')">Send Receipt</button></div></td></tr>`).join("")}</tbody></table></div>`;
+}
+function receiptPreviewHtml(receipt) {
+  const studentFirst = firstName(receipt.studentName);
+  return `<div class="receipt-preview">
+    <div class="receipt-brand"><img src="scheduled-icon.jpeg" alt="Scheduled"><div class="receipt-brand-name">Scheduled</div><div class="receipt-brand-sub">MOCK EXAMS</div><div class="receipt-document-title">Payment Receipt</div></div>
+    <h2>Thank you for choosing Scheduled Mock Exams, ${escapeHtml(studentFirst)}!</h2>
+    <p class="receipt-lead">Your access to ${escapeHtml(receipt.examType || receipt.examTitle || "Mock Exam")} has been successfully paid.</p>
+    <p class="receipt-number-line">Receipt #: ${escapeHtml(receipt.receiptNumber || "")}</p>
+    <div class="receipt-rule"></div>
+    <div class="receipt-details">
+      <div><strong>Student Name:</strong><span>${escapeHtml(receipt.studentName || "")}</span></div>
+      <div><strong>Tutor Name:</strong><span>${escapeHtml(receipt.tutorName || "")}</span></div>
+      <div><strong>Type:</strong><span>${escapeHtml(receipt.examType || receipt.examTitle || "")}</span></div>
+      <div><strong>Payment Date:</strong><span>${formatReceiptDate(receipt.paidAt)}</span></div>
+      <div><strong>Payment Time:</strong><span>${formatReceiptTime(receipt.paidAt)}</span></div>
+      <div><strong>Status:</strong><span class="receipt-status-text ${receipt.status === "paid" ? "paid" : "void"}">${escapeHtml(String(receipt.status || "").toUpperCase())}</span></div>
+    </div>
+    <div class="receipt-rule"></div>
+    <div class="receipt-total-box"><span>Total Amount Paid</span><strong>${money(receipt.amount)}</strong></div>
+    <div class="receipt-footer"><strong>Good luck in your exam, ${escapeHtml(studentFirst)}!</strong><span>Thank you for using Scheduled Mock Exams. Wishing you success in your studies!</span></div>
+  </div>`;
+}
+function viewReceipt(receiptId) {
+  const receipt = adminData.receipts?.[receiptId];
+  if (!receipt) return showToast("Receipt not found.");
+  showModal(`${receiptPreviewHtml(receipt)}<div class="modal-actions"><button class="ghost" onclick="closeModal()">Close</button><button onclick="downloadReceiptPdf('${receiptId}')">Download PDF</button><button class="whatsapp" ${receipt.status === "paid" ? "" : "disabled"} onclick="sendReceiptWhatsApp('${receiptId}')">Send Receipt on WhatsApp</button></div>`, "receipt-modal-box");
+}
+async function assetDataUrl(url) {
+  const response = await fetch(url, { cache: "force-cache" });
+  if (!response.ok) throw new Error("Could not load the Scheduled logo.");
+  const blob = await response.blob();
+  return await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+function getReceiptLogoData() {
+  if (!receiptLogoDataPromise) receiptLogoDataPromise = assetDataUrl("scheduled-icon.jpeg");
+  return receiptLogoDataPromise;
+}
+async function makeReceiptPdf(receipt) {
+  if (!window.jspdf?.jsPDF) throw new Error("PDF generator did not load. Refresh the page and try again.");
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
+  const logo = await getReceiptLogoData();
+  const W = 210, H = 297;
+  doc.setFillColor(242, 249, 255); doc.rect(0, 0, W, H, "F");
+  doc.setFillColor(255, 255, 255); doc.setDrawColor(227, 235, 243); doc.roundedRect(15, 8, 180, 281, 5, 5, "FD");
+  try { doc.addImage(logo, "JPEG", 88, 15, 34, 34); } catch (_) {}
+  doc.setTextColor(103, 191, 232); doc.setFont("helvetica", "bold"); doc.setFontSize(25); doc.text("Scheduled", 105, 57, { align: "center" });
+  doc.setTextColor(31, 42, 55); doc.setFontSize(10); doc.setCharSpace(2.2); doc.text("MOCK EXAMS", 105, 64, { align: "center" }); doc.setCharSpace(0);
+  doc.setTextColor(92, 99, 112); doc.setFont("helvetica", "normal"); doc.setFontSize(11); doc.text("Payment Receipt", 105, 75, { align: "center" });
+  const studentFirst = firstName(receipt.studentName);
+  doc.setTextColor(19, 46, 91); doc.setFont("helvetica", "bold"); doc.setFontSize(16);
+  const thanks = doc.splitTextToSize(`Thank you for choosing Scheduled Mock Exams, ${studentFirst}!`, 168);
+  doc.text(thanks, 105, 89, { align: "center", lineHeightFactor: 1.15 });
+  const thanksBottom = 89 + (thanks.length - 1) * 6.5;
+  doc.setTextColor(35, 35, 35); doc.setFont("helvetica", "normal"); doc.setFontSize(10.8);
+  const lead = doc.splitTextToSize(`Your access to ${receipt.examType || receipt.examTitle || "Mock Exam"} has been successfully paid.`, 150);
+  doc.text(lead, 105, thanksBottom + 10, { align: "center", lineHeightFactor: 1.25 });
+  const leadBottom = thanksBottom + 10 + (lead.length - 1) * 5.5;
+  doc.setFontSize(10.5); doc.text(`Receipt #: ${receipt.receiptNumber || ""}`, 105, leadBottom + 12, { align: "center" });
+  const lineY = leadBottom + 20;
+  doc.setDrawColor(205, 210, 218); doc.line(27, lineY, 183, lineY);
+  const details = [
+    ["Student Name:", receipt.studentName || ""],
+    ["Tutor Name:", receipt.tutorName || ""],
+    ["Type:", receipt.examType || receipt.examTitle || ""],
+    ["Payment Date:", formatReceiptDate(receipt.paidAt)],
+    ["Payment Time:", formatReceiptTime(receipt.paidAt)],
+    ["Status:", String(receipt.status || "").toUpperCase()]
+  ];
+  let y = lineY + 14;
+  details.forEach(([label, value], index) => {
+    doc.setTextColor(19, 46, 91); doc.setFont("helvetica", "bold"); doc.setFontSize(10.5); doc.text(label, 31, y);
+    doc.setTextColor(index === 5 ? (receipt.status === "paid" ? 30 : 190) : 35, index === 5 ? (receipt.status === "paid" ? 145 : 45) : 35, index === 5 ? (receipt.status === "paid" ? 65 : 45) : 35);
+    doc.setFont("helvetica", index === 5 ? "bold" : "normal");
+    const valueLines = doc.splitTextToSize(String(value), 100);
+    doc.text(valueLines, 78, y, { lineHeightFactor: 1.2 });
+    y += Math.max(12, valueLines.length * 5.2 + 5.5);
+  });
+  doc.setDrawColor(205, 210, 218); doc.line(27, y - 4, 183, y - 4);
+  const totalY = y + 5;
+  doc.setFillColor(239, 247, 255); doc.setDrawColor(174, 211, 244); doc.roundedRect(28, totalY, 154, 34, 3, 3, "FD");
+  doc.setTextColor(19, 46, 91); doc.setFont("helvetica", "bold"); doc.setFontSize(11); doc.text("Total Amount Paid", 105, totalY + 10, { align: "center" });
+  doc.setFontSize(28); doc.text(money(receipt.amount), 105, totalY + 26, { align: "center" });
+  const footerY = Math.min(274, totalY + 49);
+  doc.setTextColor(19, 46, 91); doc.setFontSize(11.5); doc.text(`Good luck in your exam, ${studentFirst}!`, 105, footerY, { align: "center" });
+  doc.setTextColor(55, 55, 55); doc.setFont("helvetica", "normal"); doc.setFontSize(9.3); doc.text("Thank you for using Scheduled Mock Exams.", 105, footerY + 8, { align: "center" });
+  doc.text("Wishing you success in your studies!", 105, footerY + 14, { align: "center" });
+  return doc;
+}
+async function downloadReceiptPdf(receiptId) {
+  const receipt = adminData.receipts?.[receiptId];
+  if (!receipt) return showToast("Receipt not found.");
+  try {
+    const doc = await makeReceiptPdf(receipt);
+    const filename = `Scheduled_Mock_Exams_Receipt_${safeFilePart(receipt.studentName)}_${safeFilePart(receipt.receiptNumber)}.pdf`;
+    doc.save(filename);
+    showToast("Receipt PDF downloaded.");
+    return filename;
+  } catch (error) {
+    showToast(error.message || "Could not create the receipt PDF.", 5000);
+    throw error;
+  }
+}
+function receiptWhatsAppMessage(receipt) {
+  return `Hello ${firstName(receipt.studentName)}! 👋\n\nYour payment for ${receipt.examType || receipt.examTitle || "the mock exam"} has been confirmed.\n\nAttached is your official payment receipt.\n\nReceipt number: ${receipt.receiptNumber || ""}\nTotal paid: ${money(receipt.amount)}\n\nGood luck in your exam! 💙\nThank you for using Scheduled Mock Exams.`;
+}
+async function sendReceiptWhatsApp(receiptId) {
+  const receipt = adminData.receipts?.[receiptId];
+  if (!receipt) return showToast("Receipt not found.");
+  if (receipt.status !== "paid") return showToast("Only paid receipts can be sent.");
+  const phone = normalizePhone(receipt.studentPhone) || cleanDigits(receipt.studentPhone);
+  if (!phone) return showToast("The student does not have a valid WhatsApp number.");
+  const popup = window.open("about:blank", "_blank");
+  try {
+    await downloadReceiptPdf(receiptId);
+    const url = `https://wa.me/${phone}?text=${encodeURIComponent(receiptWhatsAppMessage(receipt))}`;
+    if (popup) popup.location.href = url; else window.location.href = url;
+    showToast("Receipt downloaded and WhatsApp opened. Attach the PDF, then send.", 5200);
+  } catch (error) {
+    try { popup?.close(); } catch (_) {}
+  }
+}
+
 function attemptStatusBadge(status) {
   const map = { preparing: ["Preparing", "pending"], active: ["Active", "running"], finishedEarly: ["Finished Early", "finished"], timeEnded: ["Time Ended", "finished"], revoked: ["Blocked", "blocked"] };
   const [text, cls] = map[status] || [status || "Unknown", "neutral"];
@@ -1190,7 +1499,7 @@ function messageAttemptStudent(attemptId) {
 function renderAdminSettings() {
   $("adminContent").innerHTML = `
     <div class="grid-2">
-      <div class="card"><h2>General Settings</h2><label>WhatsApp Number for Answer Submissions</label><div class="phone-wrap"><span>+</span><input id="settingsWhatsApp" inputmode="numeric" value="${escapeHtml(adminData.settings.whatsapp || DEFAULT_WHATSAPP)}"></div><label>Default Submission Countdown (minutes)</label><input id="settingsSubmission" type="number" min="1" max="30" value="${Number(adminData.settings.defaultSubmissionMinutes || 5)}"><button onclick="saveGeneralSettings()">Save Settings</button></div>
+      <div class="card"><h2>General Settings</h2><label>Default Tutor Name for Receipts</label><input id="settingsTutorName" value="${escapeHtml(adminData.settings.tutorName || "Marly Al Houkayem")}" placeholder="Marly Al Houkayem"><label>WhatsApp Number for Answer Submissions</label><div class="phone-wrap"><span>+</span><input id="settingsWhatsApp" inputmode="numeric" value="${escapeHtml(adminData.settings.whatsapp || DEFAULT_WHATSAPP)}"></div><label>Default Submission Countdown (minutes)</label><input id="settingsSubmission" type="number" min="1" max="30" value="${Number(adminData.settings.defaultSubmissionMinutes || 5)}"><button onclick="saveGeneralSettings()">Save Settings</button></div>
       <div class="card"><h2>Admin Password</h2><p class="muted">Your admin number can log in unlimited times. Change only the password here.</p><label>New Admin Password</label><input id="newAdminPassword" type="password" placeholder="At least 6 characters"><label>Confirm Password</label><input id="confirmAdminPassword" type="password" placeholder="Repeat password"><button onclick="changeAdminPassword()">Change Password</button></div>
     </div>
     <div class="card"><h2>Website Details</h2><p class="muted">This is a separate website. It uses the same Firebase project and deployment structure as Scheduled, while all Mock Exams records are stored under a separate <strong>${ROOT}</strong> section.</p><label>Admin Number</label><div class="code-box">+${ADMIN_PHONE}</div><label>Website Link</label><div class="code-box">${escapeHtml(siteBase())}</div><label>System Version</label><div class="code-box">v${APP_VERSION}</div></div>`;
@@ -1198,8 +1507,9 @@ function renderAdminSettings() {
 async function saveGeneralSettings() {
   const whatsapp = strict961Phone($("settingsWhatsApp").value);
   const defaultSubmissionMinutes = Number($("settingsSubmission").value || 5);
+  const tutorName = $("settingsTutorName").value.trim() || "Marly Al Houkayem";
   if (!whatsapp) return showToast("Enter a valid WhatsApp number starting with 961.");
-  await rootRef("settings").update({ whatsapp, defaultSubmissionMinutes, updatedAt: now() });
+  await rootRef("settings").update({ whatsapp, defaultSubmissionMinutes, tutorName, updatedAt: now() });
   showToast("Settings saved.");
 }
 async function changeAdminPassword() {

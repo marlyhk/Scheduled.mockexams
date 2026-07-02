@@ -1,4 +1,4 @@
-SCHEDULED MOCK EXAMS v1.3
+SCHEDULED MOCK EXAMS v1.4
 ==========================
 
 This is a separate website from Scheduled.
@@ -110,3 +110,18 @@ V1.3 EXAM LOADING & WHATSAPP FIX
 - PDF pages now use an exact page-aspect frame so each page, watermark layer, footer, and border align cleanly.
 - The answer-submission WhatsApp message no longer includes the phone, exam code, login password, or any access credential.
 - The completion message includes only the student name, exam name, start time, finish time, and answer-sheet note.
+
+V1.4 RECEIPTS & PAYMENT WORKFLOW
+--------------------------------
+- Added a dedicated Receipts tab, with permanent receipt history grouped by mock exam.
+- Every new Paid action records the exact date/time and creates a unique sequential receipt number such as SME-2026-000001.
+- Added Tutor Name, Receipt Type, and Price fields to each exam.
+- Added a default Tutor Name setting.
+- Student rows now have separate Send Access Password and Send Receipt buttons.
+- Receipt PDFs use the approved Scheduled receipt layout and can be viewed or downloaded.
+- Send Receipt downloads the PDF and opens the correct student's WhatsApp chat with a prepared payment-confirmation message. Attach the downloaded PDF in the opened chat, then press Send.
+- Marking a student Unpaid voids the current receipt and pauses access.
+- Marking them Paid again creates a new receipt number and payment timestamp.
+- Removing a student does not delete their receipt history.
+- Existing students who were already Paid before v1.4 can use Create Receipt once to create their first receipt.
+- Receipts remain available even if a student or exam is later removed.
