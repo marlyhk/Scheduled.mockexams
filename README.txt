@@ -1,4 +1,4 @@
-SCHEDULED MOCK EXAMS v1.0
+SCHEDULED MOCK EXAMS v1.1
 ==========================
 
 This is a separate website from Scheduled.
@@ -83,3 +83,12 @@ All Mock Exams data is kept under the separate database path:
 mockExamAppV1
 
 The normal Scheduled interface and its existing data paths are not modified by this website.
+
+
+VERSION 1.1 FIXES
+-----------------
+- Fixed the false “one-time password has already been used” message caused by repeated Start Now requests before the attempt finished saving.
+- Start Now is now locked after the first press and safely resumes/reconstructs the same attempt if a start request was interrupted.
+- Removing a student revokes every password previously issued for that number and exam.
+- Re-adding the same number creates a completely clean enrollment with no old password, access ID, or payment state restored.
+- The generated-password WhatsApp button now always sends the newly generated password, never a cached previous password.
