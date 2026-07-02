@@ -1,6 +1,6 @@
 {
   "name": "scheduled-mock-exams",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "scripts": {
     "build": "mkdir -p public && cp index.html styles.css app.js scheduled-icon.jpeg scheduled-splash.jpeg scheduled-full-logo.jpeg public/"

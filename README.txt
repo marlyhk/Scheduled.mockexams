@@ -125,3 +125,9 @@ V1.4 RECEIPTS & PAYMENT WORKFLOW
 - Removing a student does not delete their receipt history.
 - Existing students who were already Paid before v1.4 can use Create Receipt once to create their first receipt.
 - Receipts remain available even if a student or exam is later removed.
+
+
+V1.5 RECEIPT SHARING
+- Send Receipt now uses the same Web Share file flow as Scheduled.
+- On supported phones, the generated PDF and prepared message are passed together to the share sheet.
+- The browser fallback remains available when file sharing is unsupported.

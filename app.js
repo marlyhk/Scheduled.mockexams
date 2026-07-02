@@ -35,7 +35,7 @@ const ADMIN_PHONE = "96176174738";
 const DEFAULT_WHATSAPP = "96176174738";
 const MAX_PDF_BYTES = 15 * 1024 * 1024;
 const FILE_CHUNK_CHARS = 450000;
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.5.0";
 
 let currentRole = null;
 let currentUser = null;
@@ -1442,14 +1442,36 @@ async function sendReceiptWhatsApp(receiptId) {
   if (receipt.status !== "paid") return showToast("Only paid receipts can be sent.");
   const phone = normalizePhone(receipt.studentPhone) || cleanDigits(receipt.studentPhone);
   if (!phone) return showToast("The student does not have a valid WhatsApp number.");
-  const popup = window.open("about:blank", "_blank");
+
   try {
-    await downloadReceiptPdf(receiptId);
-    const url = `https://wa.me/${phone}?text=${encodeURIComponent(receiptWhatsAppMessage(receipt))}`;
-    if (popup) popup.location.href = url; else window.location.href = url;
-    showToast("Receipt downloaded and WhatsApp opened. Attach the PDF, then send.", 5200);
+    const doc = await makeReceiptPdf(receipt);
+    const filename = `Scheduled_Mock_Exams_Receipt_${safeFilePart(receipt.studentName)}_${safeFilePart(receipt.receiptNumber)}.pdf`;
+    const blob = doc.output("blob");
+    const file = new File([blob], filename, { type: "application/pdf" });
+    const message = receiptWhatsAppMessage(receipt);
+    const shareData = {
+      title: `Scheduled Mock Exams Receipt ${receipt.receiptNumber || ""}`,
+      text: message,
+      files: [file]
+    };
+
+    const supportsFileShare = !!navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }));
+    if (supportsFileShare) {
+      await navigator.share(shareData);
+      showToast("Receipt shared with the PDF attached.");
+      return;
+    }
+
+    // Same fallback used by Scheduled on browsers that cannot share attached files.
+    doc.save(filename);
+    openWhatsApp(phone, `${message}
+
+The PDF has been downloaded. Please attach it to this chat.`);
+    showToast("This browser cannot attach files automatically. The PDF was downloaded and WhatsApp was opened.", 6000);
   } catch (error) {
-    try { popup?.close(); } catch (_) {}
+    if (error?.name !== "AbortError") {
+      showToast(error.message || "Could not share the receipt PDF.", 5000);
+    }
   }
 }
 
