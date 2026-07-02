@@ -1,4 +1,4 @@
-/* Scheduled Mock Exams v1.1
+/* Scheduled Mock Exams v1.2
    Separate static website using the same Firebase project and visual system as Scheduled.
 */
 
@@ -35,6 +35,7 @@ const ADMIN_PHONE = "96176174738";
 const DEFAULT_WHATSAPP = "96176174738";
 const MAX_PDF_BYTES = 15 * 1024 * 1024;
 const FILE_CHUNK_CHARS = 450000;
+const APP_VERSION = "1.2.0";
 
 let currentRole = null;
 let currentUser = null;
@@ -204,7 +205,7 @@ function renderStudentLogin(message = "", type = "") {
       <label>Individual Exam Password</label>
       <input id="studentPassword" type="password" autocomplete="current-password" placeholder="MHG-XXXXXXXX-XXXXXX">
       <button class="btn-block" ${examId ? "" : "disabled"} onclick="studentLogin()">Continue</button>
-      <div class="login-switch"><button onclick="renderAdminLogin()">Admin access</button></div>
+      <p class="muted tiny center">System v${APP_VERSION}</p><div class="login-switch"><button onclick="renderAdminLogin()">Admin access</button></div>
     </div>
   `);
 }
@@ -225,7 +226,7 @@ function renderAdminLogin(message = "", type = "") {
       <input id="adminPassword" type="password" autocomplete="current-password" placeholder="Your admin password">
       <button class="btn-block" onclick="adminLogin()">Open Admin Panel</button>
       <p class="muted tiny center">On the first login, the password you enter becomes your admin password. Your admin number can log in repeatedly.</p>
-      <div class="login-switch"><button onclick="renderStudentLogin()">← Student login</button></div>
+      <p class="muted tiny center">System v${APP_VERSION}</p><div class="login-switch"><button onclick="renderStudentLogin()">← Student login</button></div>
     </div>
   `);
 }
@@ -377,7 +378,7 @@ function renderStartConfirmation() {
 }
 
 async function startExamNow() {
-  // Prevent double taps/clicks from starting two overlapping requests.
+  // Prevent double taps while the start request is being completed.
   if (examStartBusy) return;
   examStartBusy = true;
   const startButton = $("startExamButton");
@@ -386,9 +387,18 @@ async function startExamNow() {
     startButton.textContent = "Starting Exam…";
   }
 
+  const releaseStartButton = () => {
+    examStartBusy = false;
+    const button = $("startExamButton");
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Start Now";
+    }
+  };
+
   const availabilityError = getAvailabilityError(currentExam);
   if (availabilityError) {
-    examStartBusy = false;
+    releaseStartButton();
     return studentErrorScreen(availabilityError, true);
   }
 
@@ -398,81 +408,17 @@ async function startExamNow() {
   const attemptRef = rootRef(`attempts/${currentAccess.id}`);
 
   try {
-    // Always check for an existing attempt first. This makes refreshes and
-    // accidental repeated taps resume the same attempt instead of reporting
-    // that the password was already used.
-    const existingAttemptSnap = await attemptRef.once("value");
-    const existingAttempt = existingAttemptSnap.val();
-    if (existingAttempt) {
-      if (existingAttempt.deviceId && existingAttempt.deviceId !== deviceId) {
-        throw new Error("This exam has already been opened on another device.");
-      }
-      currentAttempt = { id: currentAccess.id, ...existingAttempt };
-      startStudentWatchers();
-      examStartBusy = false;
-      return existingAttempt.status === "active" ? renderActiveExam() : renderFinishedScreen();
-    }
-
-    // Read the latest access record rather than relying on the login-time copy.
+    // Re-read the access directly from Firebase before starting.
     const freshAccessSnap = await accessRef.once("value");
     const freshAccess = freshAccessSnap.val();
     if (!freshAccess || freshAccess.uid !== currentUser.uid) throw new Error("This exam access is not valid.");
     if (!freshAccess.paid) throw new Error("Access is not active. Please contact your tutor.");
     if (freshAccess.allowed === false || freshAccess.status === "revoked") throw new Error("This exam access has been removed.");
-
-    let startedAt = Number(freshAccess.usedAt || 0);
-
-    // Recovery for a previous interrupted start: if access was reserved but
-    // the attempt record was not saved, reconstruct the attempt on the same
-    // device instead of falsely saying that the password was already used.
-    if (startedAt) {
-      if (freshAccess.deviceId && freshAccess.deviceId !== deviceId) {
-        throw new Error("This exam has already been opened on another device.");
-      }
-      if (!freshAccess.deviceId) await accessRef.update({ deviceId });
-    } else {
-      startedAt = now();
-      const reservation = await accessRef.transaction((access) => {
-        if (!access || access.usedAt || !access.paid || access.allowed === false || access.status === "revoked") return;
-        access.usedAt = startedAt;
-        access.status = "active";
-        access.deviceId = deviceId;
-        access.startRequestId = randomChars(12);
-        return access;
-      });
-
-      if (!reservation.committed) {
-        // A simultaneous request may have reserved the access. Re-check and
-        // resume it when it belongs to this same device.
-        const retryAttemptSnap = await attemptRef.once("value");
-        const retryAttempt = retryAttemptSnap.val();
-        if (retryAttempt) {
-          if (retryAttempt.deviceId && retryAttempt.deviceId !== deviceId) {
-            throw new Error("This exam has already been opened on another device.");
-          }
-          currentAttempt = { id: currentAccess.id, ...retryAttempt };
-          startStudentWatchers();
-          examStartBusy = false;
-          return retryAttempt.status === "active" ? renderActiveExam() : renderFinishedScreen();
-        }
-
-        const retryAccessSnap = await accessRef.once("value");
-        const retryAccess = retryAccessSnap.val();
-        if (retryAccess?.usedAt && (!retryAccess.deviceId || retryAccess.deviceId === deviceId)) {
-          startedAt = Number(retryAccess.usedAt);
-          if (!retryAccess.deviceId) await accessRef.update({ deviceId });
-        } else if (retryAccess?.deviceId && retryAccess.deviceId !== deviceId) {
-          throw new Error("This exam has already been opened on another device.");
-        } else if (retryAccess?.allowed === false || retryAccess?.status === "revoked") {
-          throw new Error("This exam access has been removed.");
-        } else {
-          throw new Error("This one-time password has already been used.");
-        }
-      }
-    }
-
-    const endsAt = startedAt + durationMinutes * 60000;
-    const attempt = {
+    // Old faulty versions may have written usedAt/deviceId before an attempt
+    // was actually created. Those fields are not treated as proof of use.
+    // Only a stored attempt can lock the password or device.
+    const startedAt = now();
+    const proposedAttempt = {
       accessId: currentAccess.id,
       examId: currentExam.id,
       examTitle: currentExam.title || "Mock Exam",
@@ -484,25 +430,56 @@ async function startExamNow() {
       deviceId,
       durationMinutesSnapshot: durationMinutes,
       startedAt,
-      endsAt,
+      endsAt: startedAt + durationMinutes * 60000,
       status: "active",
       tabSwitches: 0,
       lastSeenAt: now(),
-      recoveredStart: !!freshAccess.usedAt
+      startLogicVersion: 3
     };
 
-    // Only create the attempt if none exists. This is idempotent and safe if
-    // the browser repeats the request.
-    const attemptResult = await attemptRef.transaction((existing) => existing || attempt);
+    /*
+      The attempt itself is the one-time start lock.
+
+      Firebase may initially call a transaction with a null local value. That
+      is expected here: null means no attempt exists, so we create it. If two
+      devices press Start Now together, Firebase reruns the transaction with
+      the winning attempt and both clients receive that same record. Only the
+      device stored in the attempt is allowed to continue.
+
+      This entirely removes the old access-record transaction that produced
+      the false "password already used" message for brand-new passwords.
+    */
+    const attemptResult = await attemptRef.transaction((existing) => {
+      if (existing === null) return proposedAttempt;
+      return existing;
+    }, undefined, false);
+
     const savedAttempt = attemptResult.snapshot.val();
-    if (!savedAttempt) throw new Error("The exam could not be started.");
+    if (!savedAttempt) throw new Error("The exam could not be started. Please try again.");
+    if (savedAttempt.uid && savedAttempt.uid !== currentUser.uid) throw new Error("This exam access is not valid.");
     if (savedAttempt.deviceId && savedAttempt.deviceId !== deviceId) {
       throw new Error("This exam has already been opened on another device.");
     }
+
     currentAttempt = { id: currentAccess.id, ...savedAttempt };
 
-    // Rotate the Firebase password only after the attempt exists. Failure here
-    // never blocks the valid attempt; database access remains one-time.
+    // A previous request may already have completed or ended the attempt.
+    if (savedAttempt.status !== "active") {
+      startStudentWatchers();
+      examStartBusy = false;
+      return renderFinishedScreen();
+    }
+
+    await accessRef.update({
+      usedAt: Number(savedAttempt.startedAt || startedAt),
+      status: "active",
+      deviceId,
+      startLogicVersion: 3,
+      lastStartConfirmedAt: now()
+    });
+
+    // Invalidate the login password only after the attempt is safely stored.
+    // A password-rotation failure never destroys or blocks the valid attempt.
     if (!freshAccess.passwordConsumed) {
       try {
         await currentUser.updatePassword(randomPassword());
@@ -518,7 +495,7 @@ async function startExamNow() {
     examStartBusy = false;
     renderActiveExam();
   } catch (error) {
-    examStartBusy = false;
+    releaseStartButton();
     studentErrorScreen(error.message || "The exam could not be started.", true);
   }
 }
@@ -962,7 +939,10 @@ async function generateStudentLogin(examId, phone) {
       [`access/${accessId}`]: record,
       [`enrollments/${examId}/${phone}`]: { ...enrollment, name: student.name, phone, paid: true, allowed: true, activeAccessId: accessId, loginPassword: password, issuedAt: now(), status: "issued", updatedAt: now() }
     };
-    if (oldAccessId) { updates[`access/${oldAccessId}/allowed`] = false; updates[`access/${oldAccessId}/status`] = "revoked"; }
+    if (oldAccessId) {
+      updates[`access/${oldAccessId}/allowed`] = false;
+      updates[`access/${oldAccessId}/status`] = "revoked";
+    }
     await rootRef().update(updates);
     showStudentPasswordModal(examId, phone, password);
   } catch (error) {
@@ -1091,7 +1071,7 @@ function renderAdminSettings() {
       <div class="card"><h2>General Settings</h2><label>WhatsApp Number for Answer Submissions</label><div class="phone-wrap"><span>+</span><input id="settingsWhatsApp" inputmode="numeric" value="${escapeHtml(adminData.settings.whatsapp || DEFAULT_WHATSAPP)}"></div><label>Default Submission Countdown (minutes)</label><input id="settingsSubmission" type="number" min="1" max="30" value="${Number(adminData.settings.defaultSubmissionMinutes || 5)}"><button onclick="saveGeneralSettings()">Save Settings</button></div>
       <div class="card"><h2>Admin Password</h2><p class="muted">Your admin number can log in unlimited times. Change only the password here.</p><label>New Admin Password</label><input id="newAdminPassword" type="password" placeholder="At least 6 characters"><label>Confirm Password</label><input id="confirmAdminPassword" type="password" placeholder="Repeat password"><button onclick="changeAdminPassword()">Change Password</button></div>
     </div>
-    <div class="card"><h2>Website Details</h2><p class="muted">This is a separate website. It uses the same Firebase project and deployment structure as Scheduled, while all Mock Exams records are stored under a separate <strong>${ROOT}</strong> section.</p><label>Admin Number</label><div class="code-box">+${ADMIN_PHONE}</div><label>Website Link</label><div class="code-box">${escapeHtml(siteBase())}</div></div>`;
+    <div class="card"><h2>Website Details</h2><p class="muted">This is a separate website. It uses the same Firebase project and deployment structure as Scheduled, while all Mock Exams records are stored under a separate <strong>${ROOT}</strong> section.</p><label>Admin Number</label><div class="code-box">+${ADMIN_PHONE}</div><label>Website Link</label><div class="code-box">${escapeHtml(siteBase())}</div><label>System Version</label><div class="code-box">v${APP_VERSION}</div></div>`;
 }
 async function saveGeneralSettings() {
   const whatsapp = strict961Phone($("settingsWhatsApp").value);

@@ -92,3 +92,12 @@ VERSION 1.1 FIXES
 - Removing a student revokes every password previously issued for that number and exam.
 - Re-adding the same number creates a completely clean enrollment with no old password, access ID, or payment state restored.
 - The generated-password WhatsApp button now always sends the newly generated password, never a cached previous password.
+
+
+V1.2 CRITICAL START FIX
+-----------------------
+- Replaced the access-record transaction that could falsely report a fresh password as already used.
+- Added a dedicated per-access Firebase start lock that safely selects the first device.
+- The attempt record is now the authoritative proof that an exam started.
+- Added cache-busted app assets so deployment cannot keep serving the previous JavaScript file.
+- Removing or replacing access also clears its old start lock.
