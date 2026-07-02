@@ -1,4 +1,4 @@
-/* Scheduled Mock Exams v1.2
+/* Scheduled Mock Exams v1.3
    Separate static website using the same Firebase project and visual system as Scheduled.
 */
 
@@ -35,7 +35,7 @@ const ADMIN_PHONE = "96176174738";
 const DEFAULT_WHATSAPP = "96176174738";
 const MAX_PDF_BYTES = 15 * 1024 * 1024;
 const FILE_CHUNK_CHARS = 450000;
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 
 let currentRole = null;
 let currentUser = null;
@@ -56,6 +56,8 @@ let authFlowBusy = false;
 let examStartBusy = false;
 let studentSettings = {};
 let lastSeenWriteAt = 0;
+let preparedExamPdf = null;
+let examPreparePromise = null;
 
 const $ = (id) => document.getElementById(id);
 const now = () => Date.now() + serverOffset;
@@ -326,6 +328,7 @@ async function enterStudent() {
     startStudentWatchers();
     if (["finishedEarly", "timeEnded", "revoked"].includes(currentAttempt.status)) return renderFinishedScreen();
     if (currentAttempt.status === "active") return renderActiveExam();
+    if (currentAttempt.status === "preparing") return renderStartConfirmation();
   }
   const availabilityError = getAvailabilityError(currentExam);
   if (availabilityError) return studentErrorScreen(availabilityError, true);
@@ -354,6 +357,7 @@ function studentErrorScreen(message, allowBack = false) {
 
 function renderStartConfirmation() {
   const name = currentAccess.name || currentAccess.enteredName || "Student";
+  const alreadyPreparing = currentAttempt?.status === "preparing";
   $("studentShell").innerHTML = `
     <div class="confirm-card card">
       <div class="brand">
@@ -364,7 +368,7 @@ function renderStartConfirmation() {
       <p class="muted center">${escapeHtml(currentExam.title || "Mock Exam")}</p>
       <h2 class="good-luck center">Good luck, ${escapeHtml(name)}!</h2>
       <div class="center"><div class="duration-hero">${escapeHtml(durationLabel(currentExam.durationMinutes || 80))}</div></div>
-      <p class="center"><strong>Your timer starts only when you press Start Now.</strong></p>
+      <p class="center"><strong>Your timer starts only when the fully prepared exam is shown.</strong></p>
       ${currentExam.instructions ? `<div class="notice"><strong>Instructions:</strong><br>${escapeHtml(currentExam.instructions).replace(/\n/g,"<br>")}</div>` : ""}
       <div class="rules">
         <div class="rule"><span>⏱️</span><div><b>The timer cannot be paused or restarted.</b><div class="muted small">Refreshing the page will not reset your time.</div></div></div>
@@ -372,19 +376,105 @@ function renderStartConfirmation() {
         <div class="rule"><span>📝</span><div><b>Solve on paper.</b><div class="muted small">Prepare blank paper and any permitted calculator before starting.</div></div></div>
         <div class="rule"><span>💬</span><div><b>Send your answer photos on WhatsApp.</b><div class="muted small">A five-minute submission countdown starts when the exam ends.</div></div></div>
       </div>
-      <button id="startExamButton" class="btn-block" onclick="startExamNow()">Start Now</button>
+      <div id="examPreparationStatus" class="notice"><strong>Preparing your exam…</strong><br><span id="examPreparationText">Loading the secure exam pages before your timer begins.</span></div>
+      <button id="startExamButton" class="btn-block" onclick="startExamNow()" disabled>${alreadyPreparing ? "Continue Preparing…" : "Preparing Exam…"}</button>
       <button class="btn-block ghost" onclick="studentLogout()">Return to Login</button>
     </div>`;
+  prepareExamForStart();
 }
 
+async function prepareExamForStart(force = false) {
+  if (!currentExam?.id) return false;
+  if (!force && preparedExamPdf?.examId === currentExam.id && preparedExamPdf.pages?.length) {
+    markExamPrepared();
+    return true;
+  }
+  if (!force && examPreparePromise) return examPreparePromise;
+  const status = $("examPreparationStatus");
+  const text = $("examPreparationText");
+  const button = $("startExamButton");
+  if (status) status.className = "notice";
+  if (text) text.textContent = "Loading the secure exam pages before your timer begins.";
+  if (button) { button.disabled = true; button.textContent = "Preparing Exam…"; }
+
+  examPreparePromise = (async () => {
+    try {
+      const bytes = await loadExamPdfBytes(currentExam.id);
+      const prepared = await renderPdfPagesToMemory(bytes, (page, total) => {
+        const progressText = $("examPreparationText");
+        if (progressText) progressText.textContent = `Preparing page ${page} of ${total}…`;
+      });
+      preparedExamPdf = { examId: currentExam.id, ...prepared };
+      markExamPrepared();
+      return true;
+    } catch (error) {
+      preparedExamPdf = null;
+      const statusNow = $("examPreparationStatus");
+      const textNow = $("examPreparationText");
+      const buttonNow = $("startExamButton");
+      if (statusNow) statusNow.className = "notice error";
+      if (textNow) textNow.textContent = error.message || "The exam could not be prepared.";
+      if (buttonNow) {
+        buttonNow.disabled = false;
+        buttonNow.textContent = "Retry Preparing Exam";
+        buttonNow.onclick = () => prepareExamForStart(true);
+      }
+      return false;
+    } finally {
+      examPreparePromise = null;
+    }
+  })();
+  return examPreparePromise;
+}
+
+function markExamPrepared() {
+  const status = $("examPreparationStatus");
+  const text = $("examPreparationText");
+  const button = $("startExamButton");
+  if (status) status.className = "notice success";
+  if (text) text.textContent = "All exam pages are ready. Your timer has not started.";
+  if (button) {
+    button.disabled = false;
+    button.textContent = "Start Now";
+    button.onclick = startExamNow;
+  }
+}
+
+async function renderPdfPagesToMemory(bytes, onProgress) {
+  const loadingTask = pdfjsLib.getDocument({ data: bytes, disableAutoFetch: false, disableStream: false });
+  const pdf = await loadingTask.promise;
+  const pages = [];
+  const availableCssWidth = Math.min(1050, Math.max(280, window.innerWidth - 38));
+  const pixelRatio = Math.min(2.25, Math.max(1, window.devicePixelRatio || 1));
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+    const page = await pdf.getPage(pageNumber);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const cssScale = availableCssWidth / baseViewport.width;
+    const cssViewport = page.getViewport({ scale: cssScale });
+    const renderViewport = page.getViewport({ scale: cssScale * pixelRatio });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.ceil(renderViewport.width);
+    canvas.height = Math.ceil(renderViewport.height);
+    canvas.dataset.cssWidth = String(cssViewport.width);
+    canvas.dataset.cssHeight = String(cssViewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d", { alpha: false }), viewport: renderViewport }).promise;
+    pages.push({ pageNumber, canvas, cssWidth: cssViewport.width, cssHeight: cssViewport.height });
+    onProgress?.(pageNumber, pdf.numPages);
+  }
+  return { pages, numPages: pdf.numPages };
+}
 async function startExamNow() {
-  // Prevent double taps while the start request is being completed.
   if (examStartBusy) return;
+  if (!(preparedExamPdf?.examId === currentExam?.id && preparedExamPdf.pages?.length)) {
+    const ready = await prepareExamForStart();
+    if (!ready) return;
+  }
+
   examStartBusy = true;
   const startButton = $("startExamButton");
   if (startButton) {
     startButton.disabled = true;
-    startButton.textContent = "Starting Exam…";
+    startButton.textContent = "Opening Prepared Exam…";
   }
 
   const releaseStartButton = () => {
@@ -408,17 +498,13 @@ async function startExamNow() {
   const attemptRef = rootRef(`attempts/${currentAccess.id}`);
 
   try {
-    // Re-read the access directly from Firebase before starting.
     const freshAccessSnap = await accessRef.once("value");
     const freshAccess = freshAccessSnap.val();
     if (!freshAccess || freshAccess.uid !== currentUser.uid) throw new Error("This exam access is not valid.");
     if (!freshAccess.paid) throw new Error("Access is not active. Please contact your tutor.");
     if (freshAccess.allowed === false || freshAccess.status === "revoked") throw new Error("This exam access has been removed.");
-    // Old faulty versions may have written usedAt/deviceId before an attempt
-    // was actually created. Those fields are not treated as proof of use.
-    // Only a stored attempt can lock the password or device.
-    const startedAt = now();
-    const proposedAttempt = {
+
+    const preparingAttempt = {
       accessId: currentAccess.id,
       examId: currentExam.id,
       examTitle: currentExam.title || "Mock Exam",
@@ -429,78 +515,93 @@ async function startExamNow() {
       enteredName: currentAccess.enteredName || "",
       deviceId,
       durationMinutesSnapshot: durationMinutes,
-      startedAt,
-      endsAt: startedAt + durationMinutes * 60000,
-      status: "active",
+      status: "preparing",
+      preparedAt: now(),
       tabSwitches: 0,
       lastSeenAt: now(),
-      startLogicVersion: 3
+      startLogicVersion: 4
     };
 
-    /*
-      The attempt itself is the one-time start lock.
-
-      Firebase may initially call a transaction with a null local value. That
-      is expected here: null means no attempt exists, so we create it. If two
-      devices press Start Now together, Firebase reruns the transaction with
-      the winning attempt and both clients receive that same record. Only the
-      device stored in the attempt is allowed to continue.
-
-      This entirely removes the old access-record transaction that produced
-      the false "password already used" message for brand-new passwords.
-    */
     const attemptResult = await attemptRef.transaction((existing) => {
-      if (existing === null) return proposedAttempt;
+      if (existing === null) return preparingAttempt;
       return existing;
     }, undefined, false);
 
     const savedAttempt = attemptResult.snapshot.val();
     if (!savedAttempt) throw new Error("The exam could not be started. Please try again.");
     if (savedAttempt.uid && savedAttempt.uid !== currentUser.uid) throw new Error("This exam access is not valid.");
-    if (savedAttempt.deviceId && savedAttempt.deviceId !== deviceId) {
-      throw new Error("This exam has already been opened on another device.");
-    }
+    if (savedAttempt.deviceId && savedAttempt.deviceId !== deviceId) throw new Error("This exam has already been opened on another device.");
 
     currentAttempt = { id: currentAccess.id, ...savedAttempt };
-
-    // A previous request may already have completed or ended the attempt.
-    if (savedAttempt.status !== "active") {
+    if (["finishedEarly", "timeEnded", "revoked"].includes(savedAttempt.status)) {
       startStudentWatchers();
       examStartBusy = false;
       return renderFinishedScreen();
     }
-
-    await accessRef.update({
-      usedAt: Number(savedAttempt.startedAt || startedAt),
-      status: "active",
-      deviceId,
-      startLogicVersion: 3,
-      lastStartConfirmedAt: now()
-    });
-
-    // Invalidate the login password only after the attempt is safely stored.
-    // A password-rotation failure never destroys or blocks the valid attempt.
-    if (!freshAccess.passwordConsumed) {
-      try {
-        await currentUser.updatePassword(randomPassword());
-        await accessRef.update({ passwordConsumed: true, passwordConsumedAt: now(), passwordRotationError: null });
-      } catch (passwordError) {
-        console.warn("One-time password rotation failed:", passwordError);
-        await accessRef.update({ passwordConsumed: false, passwordRotationError: String(passwordError.code || passwordError.message || "unknown") });
-      }
+    if (savedAttempt.status === "active") {
+      startStudentWatchers();
+      examStartBusy = false;
+      return renderActiveExam();
     }
 
-    try { await document.documentElement.requestFullscreen?.(); } catch (_) {}
-    startStudentWatchers();
+    await accessRef.update({ status: "preparing", deviceId, startLogicVersion: 4 });
+
+    // Place every already-rendered page on screen behind a short start cover.
+    // No official exam time is consumed during PDF loading or Firebase setup.
+    await renderActiveExam({ preparing: true });
+
+    const startedAt = now();
+    const activeFields = {
+      status: "active",
+      startedAt,
+      endsAt: startedAt + durationMinutes * 60000,
+      durationMinutesSnapshot: durationMinutes,
+      activatedAt: startedAt,
+      lastSeenAt: startedAt,
+      startLogicVersion: 4
+    };
+    currentAttempt = { ...currentAttempt, ...activeFields };
+
+    // Reveal the fully loaded pages and start the visible timer immediately.
+    // Firebase persistence follows the same official timestamp.
+    updateExamWatermarks();
+    $("examStartOverlay")?.remove();
+    startExamTimer();
     examStartBusy = false;
-    renderActiveExam();
+
+    const activationWrite = attemptRef.update(activeFields);
+    const accessWrite = accessRef.update({
+      usedAt: startedAt,
+      status: "active",
+      deviceId,
+      startLogicVersion: 4,
+      lastStartConfirmedAt: startedAt
+    });
+
+    try { await document.documentElement.requestFullscreen?.(); } catch (_) {}
+
+    await Promise.all([activationWrite, accessWrite]);
+    startStudentWatchers(true);
+
+    if (!freshAccess.passwordConsumed) {
+      currentUser.updatePassword(randomPassword()).then(() =>
+        accessRef.update({ passwordConsumed: true, passwordConsumedAt: now(), passwordRotationError: null })
+      ).catch((passwordError) => {
+        console.warn("One-time password rotation failed:", passwordError);
+        accessRef.update({ passwordConsumed: false, passwordRotationError: String(passwordError.code || passwordError.message || "unknown") }).catch(() => {});
+      });
+    }
   } catch (error) {
     releaseStartButton();
     studentErrorScreen(error.message || "The exam could not be started.", true);
   }
 }
-function startStudentWatchers() {
-  stopStudentWatchers();
+function startStudentWatchers(preserveTimers = false) {
+  if (accessWatchRef) accessWatchRef.off();
+  if (attemptWatchRef) attemptWatchRef.off();
+  accessWatchRef = null;
+  attemptWatchRef = null;
+  if (!preserveTimers) { clearInterval(timerHandle); clearInterval(submissionHandle); }
   accessWatchRef = rootRef(`access/${currentAccess.id}`);
   accessWatchRef.on("value", (snap) => {
     const value = snap.val();
@@ -525,26 +626,35 @@ function stopStudentWatchers() {
   clearInterval(timerHandle); clearInterval(submissionHandle);
 }
 
-async function renderActiveExam() {
-  if (!currentAttempt || currentAttempt.status !== "active") return renderFinishedScreen();
+async function renderActiveExam(options = {}) {
+  const preparing = Boolean(options.preparing);
+  if (!currentAttempt || (!preparing && currentAttempt.status !== "active")) return renderFinishedScreen();
   $("studentShell").innerHTML = `
     <div class="student-header">
       <div class="top-brand"><img src="scheduled-icon.jpeg" alt="Scheduled"><div><h1>Scheduled</h1><p>Mock Exams</p></div></div>
-      <button class="ghost small-btn" onclick="confirmFinishEarly()">Finish Exam</button>
+      <button class="ghost small-btn" onclick="confirmFinishEarly()" ${preparing ? "disabled" : ""}>Finish Exam</button>
     </div>
     <div class="student-content">
       <div class="exam-sticky">
         <div><h2>${escapeHtml(currentExam.title || "Mock Exam")}</h2><div class="muted">${escapeHtml(currentAttempt.name)} • ${escapeHtml(currentAttempt.examCode || "")}</div></div>
-        <div id="mainTimer" class="timer"><span>Time Remaining</span><strong>--:--</strong></div>
+        <div id="mainTimer" class="timer"><span>Time Remaining</span><strong>${preparing ? durationLabelClock(currentExam.durationMinutes || 80) : "--:--"}</strong></div>
       </div>
-      <div id="examNotice" class="notice">Loading your personalized exam…</div>
+      <div id="examNotice" class="notice">${preparing ? "Your exam is fully prepared. Starting securely…" : "Loading your personalized exam…"}</div>
       <div id="examPages" class="exam-pages"></div>
-      <div class="card center"><p><strong>Finished before the timer?</strong></p><p class="muted small">Pressing Finish Exam permanently hides the questions and starts the WhatsApp submission countdown.</p><button class="danger" onclick="confirmFinishEarly()">Finish Exam</button></div>
-    </div>`;
-  startExamTimer();
+      <div class="card center"><p><strong>Finished before the timer?</strong></p><p class="muted small">Pressing Finish Exam permanently hides the questions and starts the WhatsApp submission countdown.</p><button class="danger" onclick="confirmFinishEarly()" ${preparing ? "disabled" : ""}>Finish Exam</button></div>
+    </div>
+    ${preparing ? `<div id="examStartOverlay" class="exam-start-overlay"><div class="exam-start-overlay-card"><div class="mini-loader"></div><strong>Opening your prepared exam…</strong><span>Your timer has not started yet.</span></div></div>` : ""}`;
   await renderExamPdf();
+  if (!preparing) startExamTimer();
 }
 
+function durationLabelClock(minutes) {
+  const totalSeconds = Math.max(0, Math.round(Number(minutes || 0) * 60));
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const sec = totalSeconds % 60;
+  return h > 0 ? `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}` : `${String(m).padStart(2,"0")}:${String(sec).padStart(2,"0")}`;
+}
 function startExamTimer() {
   clearInterval(timerHandle);
   const tick = async () => {
@@ -579,37 +689,48 @@ async function loadExamPdfBytes(examId) {
   return base64ToUint8Array(chunks.join(""));
 }
 
+function makeExamPageWrap(pageData, totalPages) {
+  const wrap = document.createElement("div");
+  wrap.className = "pdf-page-wrap";
+  wrap.style.setProperty("--page-width", `${pageData.cssWidth}px`);
+  wrap.style.setProperty("--page-ratio", String(pageData.cssWidth / pageData.cssHeight));
+  wrap.oncontextmenu = (e) => e.preventDefault();
+  const canvas = pageData.canvas;
+  canvas.style.width = "100%";
+  canvas.style.height = "100%";
+  const overlay = document.createElement("div");
+  overlay.className = "watermark-layer";
+  overlay.dataset.pageNumber = String(pageData.pageNumber);
+  overlay.dataset.totalPages = String(totalPages);
+  wrap.append(canvas, overlay);
+  return wrap;
+}
+
+function updateExamWatermarks() {
+  const wm = `${currentAttempt?.name || "Student"} • +${currentAttempt?.phone || ""} • ${currentAttempt?.examCode || ""} • ${formatDateTime(currentAttempt?.startedAt)}`;
+  document.querySelectorAll(".watermark-layer").forEach((overlay) => {
+    const pageNumber = overlay.dataset.pageNumber || "";
+    const totalPages = overlay.dataset.totalPages || "";
+    overlay.innerHTML = `<div class="watermark-text">${escapeHtml(wm)}<br>${escapeHtml(wm)}</div><div class="page-footer"><span>CONFIDENTIAL • SCHEDULED MOCK EXAMS</span><span>Page ${pageNumber}/${totalPages}</span></div>`;
+  });
+}
+
 async function renderExamPdf() {
   const token = ++pdfRenderToken;
   try {
-    const bytes = await loadExamPdfBytes(currentExam.id);
+    let prepared = preparedExamPdf?.examId === currentExam.id ? preparedExamPdf : null;
+    if (!prepared?.pages?.length) {
+      const bytes = await loadExamPdfBytes(currentExam.id);
+      if (token !== pdfRenderToken) return;
+      prepared = { examId: currentExam.id, ...(await renderPdfPagesToMemory(bytes)) };
+      preparedExamPdf = prepared;
+    }
     if (token !== pdfRenderToken) return;
-    const loadingTask = pdfjsLib.getDocument({ data: bytes, disableAutoFetch: false, disableStream: false });
-    const pdf = await loadingTask.promise;
     const container = $("examPages");
     if (!container) return;
     container.innerHTML = "";
-    const wm = `${currentAttempt.name} • +${currentAttempt.phone} • ${currentAttempt.examCode} • ${formatDateTime(currentAttempt.startedAt)}`;
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
-      if (token !== pdfRenderToken) return;
-      const page = await pdf.getPage(pageNumber);
-      const baseViewport = page.getViewport({ scale: 1 });
-      const maxWidth = Math.min(1050, Math.max(320, container.clientWidth || 900));
-      const scale = Math.min(2.2, Math.max(1.25, maxWidth / baseViewport.width * (window.devicePixelRatio || 1)));
-      const viewport = page.getViewport({ scale });
-      const wrap = document.createElement("div");
-      wrap.className = "pdf-page-wrap";
-      wrap.oncontextmenu = (e) => e.preventDefault();
-      const canvas = document.createElement("canvas");
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const overlay = document.createElement("div");
-      overlay.className = "watermark-layer";
-      overlay.innerHTML = `<div class="watermark-text">${escapeHtml(wm)}<br>${escapeHtml(wm)}</div><div class="page-footer"><span>CONFIDENTIAL • SCHEDULED MOCK EXAMS</span><span>Page ${pageNumber}/${pdf.numPages}</span></div>`;
-      wrap.append(canvas, overlay);
-      container.appendChild(wrap);
-      await page.render({ canvasContext: canvas.getContext("2d", { alpha: false }), viewport }).promise;
-    }
+    prepared.pages.forEach((pageData) => container.appendChild(makeExamPageWrap(pageData, prepared.numPages)));
+    updateExamWatermarks();
     $("examNotice")?.classList.add("hidden");
   } catch (error) {
     const notice = $("examNotice");
@@ -617,9 +738,9 @@ async function renderExamPdf() {
       notice.className = "notice error";
       notice.textContent = error.message || "Could not load the exam PDF.";
     }
+    throw error;
   }
 }
-
 function confirmFinishEarly() {
   showModal(`
     <h2>Finish your exam?</h2>
@@ -683,13 +804,14 @@ function startSubmissionTimer() {
 }
 function sendAnswersWhatsApp() {
   const settingsWa = studentSettings.whatsapp || currentExam?.whatsapp || DEFAULT_WHATSAPP;
-  const message = `Hello, I completed the ${currentExam?.title || currentAttempt?.examTitle || "mock exam"}.\n\nName: ${currentAttempt?.name || currentAccess?.name || ""}\nPhone: +${currentAttempt?.phone || currentAccess?.phone || ""}\nExam Code: ${currentAttempt?.examCode || currentExam?.examCode || ""}\n\nI will send my answer sheets now.`;
+  const examName = currentExam?.title || currentAttempt?.examTitle || "Mock Exam";
+  const studentName = currentAttempt?.name || currentAccess?.name || currentAccess?.enteredName || "";
+  const message = `Hello, I just took the exam.\n\nStudent name: ${studentName}\nExam: ${examName}\nStart time: ${formatDateTime(currentAttempt?.startedAt)}\nFinish time: ${formatDateTime(currentAttempt?.finishedAt)}\n\nI will send my answer sheets now.`;
   openWhatsApp(settingsWa, message);
 }
-
 async function studentLogout() {
   stopStudentWatchers();
-  currentRole = null; currentUser = null; currentAccess = null; currentExam = null; currentAttempt = null;
+  currentRole = null; currentUser = null; currentAccess = null; currentExam = null; currentAttempt = null; preparedExamPdf = null; examPreparePromise = null;
   try { await auth.signOut(); } catch (_) {}
   renderStudentLogin();
 }
@@ -1023,7 +1145,7 @@ async function removeStudentFromExam(examId, phone) {
 }
 
 function attemptStatusBadge(status) {
-  const map = { active: ["Active", "running"], finishedEarly: ["Finished Early", "finished"], timeEnded: ["Time Ended", "finished"], revoked: ["Blocked", "blocked"] };
+  const map = { preparing: ["Preparing", "pending"], active: ["Active", "running"], finishedEarly: ["Finished Early", "finished"], timeEnded: ["Time Ended", "finished"], revoked: ["Blocked", "blocked"] };
   const [text, cls] = map[status] || [status || "Unknown", "neutral"];
   return badge(text, cls);
 }

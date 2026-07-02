@@ -1,4 +1,4 @@
-SCHEDULED MOCK EXAMS v1.1
+SCHEDULED MOCK EXAMS v1.3
 ==========================
 
 This is a separate website from Scheduled.
@@ -101,3 +101,12 @@ V1.2 CRITICAL START FIX
 - The attempt record is now the authoritative proof that an exam started.
 - Added cache-busted app assets so deployment cannot keep serving the previous JavaScript file.
 - Removing or replacing access also clears its old start lock.
+
+V1.3 EXAM LOADING & WHATSAPP FIX
+--------------------------------
+- The full PDF is downloaded and every page is rendered before Start Now becomes available.
+- The official attempt timer begins only after the prepared pages are already on screen and revealed.
+- Students no longer lose exam time waiting for PDF pages to load.
+- PDF pages now use an exact page-aspect frame so each page, watermark layer, footer, and border align cleanly.
+- The answer-submission WhatsApp message no longer includes the phone, exam code, login password, or any access credential.
+- The completion message includes only the student name, exam name, start time, finish time, and answer-sheet note.

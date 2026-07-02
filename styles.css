@@ -56,3 +56,56 @@ button:hover,.button:hover{transform:translateY(-1px);filter:brightness(.99)}but
   .app{padding:11px}.auth-shell{margin:2vh auto}.auth-card,.card{border-radius:23px;padding:17px}.brand h1{font-size:34px}.grid-2{grid-template-columns:1fr}.topbar{align-items:flex-start}.top-actions .label-hide{display:none}.top-brand h1{font-size:25px}.exam-item{display:block}.exam-actions{justify-content:flex-start;margin-top:12px}.student-header{align-items:flex-start}.exam-sticky{top:6px;border-radius:18px;padding:11px}.exam-sticky h2{font-size:16px;margin:0}.exam-sticky .muted{font-size:11px}.timer strong{font-size:22px}.good-luck{font-size:29px}.submission-count{font-size:38px}.table{min-width:760px}
 }
 @media print{body *{display:none!important}body::after{content:"Printing is disabled for this mock exam.";display:block!important;padding:40px;font-size:20px}}
+
+/* v1.3 — exact PDF framing and pre-start preparation cover */
+.exam-pages{justify-items:center;align-items:start}
+.pdf-page-wrap{
+  width:min(100%,var(--page-width,1050px));
+  aspect-ratio:var(--page-ratio,0.7071);
+  margin:0 auto;
+  line-height:0;
+  border-radius:14px;
+  background:#fff;
+}
+.pdf-page-wrap canvas{
+  display:block;
+  width:100%!important;
+  height:100%!important;
+  object-fit:fill;
+  margin:0;
+  border:0;
+}
+.watermark-layer{inset:0;border-radius:inherit}
+.exam-start-overlay{
+  position:fixed;
+  inset:0;
+  z-index:850;
+  display:grid;
+  place-items:center;
+  padding:20px;
+  background:rgba(247,252,255,.96);
+  backdrop-filter:blur(10px);
+}
+.exam-start-overlay-card{
+  width:min(390px,100%);
+  display:grid;
+  justify-items:center;
+  gap:10px;
+  padding:25px;
+  border:1px solid var(--border);
+  border-radius:24px;
+  background:#fff;
+  box-shadow:var(--shadow);
+  text-align:center;
+}
+.exam-start-overlay-card strong{font-size:18px}
+.exam-start-overlay-card span{color:var(--muted);font-size:13px}
+.mini-loader{
+  width:34px;
+  height:34px;
+  border:4px solid var(--blue-soft);
+  border-top-color:var(--blue-dark);
+  border-radius:50%;
+  animation:mockSpin .75s linear infinite;
+}
+@keyframes mockSpin{to{transform:rotate(360deg)}}
